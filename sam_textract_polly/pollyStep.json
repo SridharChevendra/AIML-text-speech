@@ -1,0 +1,401 @@
+{
+  "Comment": "State Machine to process files to voice",
+  "StartAt": "Pass State",
+  "States": {
+    "Pass State": {
+      "Type": "Pass",
+      "Parameters": {
+        "s3Payload": {
+          "s3Bucket.$": "$.Records[0].s3.bucket.name",
+          "s3Object.$": "$.Records[0].s3.object.key",
+          "s3Size.$": "$.Records[0].s3.object.size",
+          "s3Etag.$": "$.Records[0].s3.object.eTag"
+        }
+      },
+      "Next": "Verify item from DynamoDB"
+    },
+    "Text to Audio": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TextPollyFunctionArn}",
+        "Payload": {
+          "bucketName.$": "$.s3Payload.s3Bucket",
+          "fileName.$": "$.s3Payload.s3Object"
+        }
+        
+      },
+      "ResultSelector": {
+        "mp3FileName.$": "$.Payload.mp3FileName"
+      },
+      "ResultPath": "$.contentOutput",
+      "OutputPath": "$",
+      "Next": "DynamoDB Update"
+    },
+    "Verify item from DynamoDB": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "${DynamoDBTableName}",
+        "Key": {
+          "etag": {
+            "S.$": "$.s3Payload.s3Etag"
+          }
+        }
+      },
+      "ResultPath": "$.verifyDynamoDB",
+      "OutputPath": "$",
+      "Retry": [
+       {
+        "ErrorEquals":["States.TaskFailed"],
+        "IntervalSeconds": 3,
+        "BackoffRate": 1.5,
+        "MaxAttempts": 2
+        }
+      ],
+      "Next": "Audio Existed?"
+    },
+    "Audio Existed?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.verifyDynamoDB.Item.etag.S",
+          "IsPresent": false,
+          "Next": "File size >5MB"
+        },
+        
+        { 
+          "And":[
+            {
+              "Variable": "$.verifyDynamoDB.Item.etag.S",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.verifyDynamoDB.Item.filekey.S",
+              "IsPresent": false
+            
+            }
+            
+          ],
+          "Next": "File size >5MB"
+        },
+        
+        { "And":[
+          {
+            "Variable": "$.verifyDynamoDB.Item.etag.S",
+            "IsPresent": true
+            
+          },
+          {
+            "Variable": "$.verifyDynamoDB.Item.filekey.S",
+            "IsPresent": true
+            
+          }
+          
+        
+          ],
+            "Next": "DynamoDB CacheUpdate"
+        }
+      ]
+    },
+    "File size >5MB":{
+      "Type": "Choice",
+      "Choices":[
+        {
+
+          "Variable": "$.s3Payload.s3Size",
+          "NumericGreaterThan": 524288000,
+          "Next": "Manual Approval"
+        },
+        {
+
+          "Variable": "$.s3Payload.s3Size",
+          "NumericLessThanEquals": 524288000,
+          "Next": "Check file type"
+        }
+        ],
+        "Default": "Check file type"
+    },
+    "Check file type": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.s3Payload.s3Size",
+              "NumericLessThanEquals": 524288000
+            },
+            {
+              "Variable": "$.s3Payload.s3Object",
+              "StringMatches": "*.pdf"
+            }
+          ],
+          "Next": "textRactFunction"
+        },
+        
+        {
+          "And": [
+            {
+              "Variable": "$.s3Payload.s3Size",
+              "NumericLessThanEquals": 524288000
+            },
+                       {
+              "Variable": "$.s3Payload.s3Object",
+              "StringMatches": "*.JPG"
+            }
+            
+            
+          ],
+          "Next": "textRactFunction"
+        },
+        
+        {
+          "And": [
+            {
+              "Variable": "$.s3Payload.s3Size",
+              "NumericLessThanEquals": 524288000
+            },
+            {
+              "Variable": "$.s3Payload.s3Object",
+              "StringMatches": "*.txt"
+            }
+          ],
+          "Next": "Text to Audio"
+        }
+        
+      ],
+      "Default": "UpdateFailureCount"
+    },
+    "Manual Approval": {
+      "Type": "Task",
+      "Resource": "${TaskPollerFunctionArn}",
+      "Next": "Check file type"
+    },
+    "textRactFunction": {
+      "Type": "Task",
+      "Resource": "${TextractFunctionArn}",
+      "Parameters": {
+        "Records.$": "$.s3Payload"
+      },
+      "ResultPath": "$.textractOutput",
+      "OutputPath": "$",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "Next": "UpdateFailureCount"
+        }
+      ],
+      "Next": "Wait State"
+    },
+    "Wait State": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "checkStaus"
+    },
+    "checkStaus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TextractStatusFunctionArn}",
+        "Payload": {
+          "jobId.$": "$.textractOutput.jobId",
+          "fileName.$": "$.textractOutput.fileName"
+        }
+      },
+      "ResultSelector": {
+        "jobStatus.$": "$.Payload.jobStatus"
+      },
+      "ResultPath": "$.checkstatusOutput",
+      "OutputPath": "$",
+      "Next": "Get Status",
+      "Retry": [
+       {
+        "ErrorEquals":["States.TaskFailed"],
+        "IntervalSeconds": 3,
+        "BackoffRate": 1.5,
+        "MaxAttempts": 2
+        }
+    
+      ]
+    },
+    "Get Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.checkstatusOutput.jobStatus",
+          "StringEquals": "IN_PROGRESS",
+          "Next": "Wait State"
+        },
+        {
+          "Variable": "$.checkstatusOutput.jobStatus",
+          "StringEquals": "SUCCEEDED",
+          "Next": "Content"
+        }
+      ],
+      "Default": "Content"
+    },
+    "Content": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TextractPollyFunctionArn}",
+        "Payload": {
+          "jobId.$": "$.textractOutput.jobId",
+          "fileName.$": "$.textractOutput.fileName"
+        }
+      },
+      "ResultSelector": {
+        "mp3FileName.$": "$.Payload.mp3FileName",
+        "jobId.$": "$.Payload.jobId"
+      },
+      "ResultPath": "$.contentOutput",
+      "OutputPath": "$",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "UpdateFailureCount"
+        }
+      ],
+      "Next": "Wait State1"
+      },
+    "Wait State1": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "Check PollyJobStatus"
+    },
+    "Check PollyJobStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PollyStatusFunctionArn}",
+        "Payload": {
+          "jobId.$": "$.contentOutput.jobId",
+          "fileName.$": "$.s3Payload.s3Object"
+        }
+      },
+      "ResultSelector": {
+        "jobStatus.$": "$.Payload.jobStatus"
+      },
+      "ResultPath": "$.checkstatusOutput1",
+      "OutputPath": "$",
+      "Next": "PollyJobComplete?",
+      "Retry": [
+       {
+        "ErrorEquals":["States.TaskFailed"],
+        "IntervalSeconds": 3,
+        "BackoffRate": 1.5,
+        "MaxAttempts": 2
+        }
+    
+      ]
+    },
+    "PollyJobComplete?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.checkstatusOutput1.jobStatus",
+          "StringEquals": "scheduled",
+          "Next": "Wait State1"
+        },
+        {
+          "Variable": "$.checkstatusOutput1.jobStatus",
+          "StringEquals": "completed",
+          "Next": "DynamoDB Update"
+        }
+      ],
+      "Default": "DynamoDB Update"
+    },
+    "DynamoDB Update": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${DynamoDBTableName}",
+        "Key": {
+          "etag": {
+            "S.$": "$.s3Payload.s3Etag"
+            }
+          },
+        "UpdateExpression": "SET filekey = :myValueRef",
+        "ExpressionAttributeValues": {
+            ":myValueRef": {
+              "S.$": "$.contentOutput.mp3FileName"
+            }
+         }
+          },
+      "ResultSelector": {
+        "HttpCode.$": "$.SdkHttpMetadata.HttpStatusCode",
+        "RequestId.$": "$.SdkResponseMetadata.RequestId"
+      },
+      "ResultPath": "$.DynamoUpdate",
+      "OutputPath": "$",
+      "Next": "S3Url"
+    },
+    "DynamoDB CacheUpdate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${DynamoDBTableName}",
+        "Key": {
+          "etag": {
+            "S.$": "$.s3Payload.s3Etag"
+            }
+          },
+        "UpdateExpression": "SET #Cached = #Cached + :Count",
+        "ExpressionAttributeNames" : {"#Cached": "Cached" },
+        "ExpressionAttributeValues": {
+            ":Count": {
+              "N": "1"
+            }
+         }
+          },
+      "ResultSelector": {
+        "HttpCode.$": "$.SdkHttpMetadata.HttpStatusCode",
+        "RequestId.$": "$.SdkResponseMetadata.RequestId"
+      },
+      "ResultPath": "$.DynamoCacheUpdate",
+      "OutputPath": "$",
+      "Next": "S3Url"
+    },
+    "S3Url": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${S3presignFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.lambdaOutput",
+      "OutputPath": "$.lambdaOutput.Payload",
+      "End": true
+    },
+    "UpdateFailureCount": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${DynamoDBTableName}",
+        "Key": {
+          "etag": {
+            "S.$": "$.s3Payload.s3Etag"
+            }
+          },
+        "UpdateExpression": "SET #Failures = #Failures + :Count",
+        "ExpressionAttributeNames" : {"#Failures": "FailedAttempts" },
+        "ExpressionAttributeValues": {
+            ":Count": {
+              "N": "1"
+            }
+         }
+          },
+      "ResultSelector": {
+        "HttpCode.$": "$.SdkHttpMetadata.HttpStatusCode",
+        "RequestId.$": "$.SdkResponseMetadata.RequestId"
+      },
+      "ResultPath": "$.FailureCount",
+      "OutputPath": "$",
+      "End": true
+    },
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "s3Payload": {
+    "s3Size": 833270,
+    "s3Object": "textfile.txt",
+    "s3Etag": "e24de2b38dbb68fc015f0ee223f0b61b",
+    "s3Bucket": "sc-textract3"
+  }
+}

@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  sam-polly
+
+  Sample SAM Template for sam-polly
+
+# Input parameters
+Parameters:
+  BucketNameParameter:
+    Type: String
+    Description: Enter the S3 bucketname. Bucketname needs to be unique
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+    Runtime: python3.8
+    CodeUri: sam_textract_polly/
+    Layers:
+      - !Sub "arn:aws:lambda:${AWS::Region}:580247275435:layer:LambdaInsightsExtension:12"
+    # Tracing: Active
+    Tags:
+      Application: Text2Audio
+
+Resources:
+  # Create S3 bucket
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketNameParameter
+      Tags:
+        - Key: Application
+          Value: Text2Audio
+      # S3 bucket filters and notification
+      NotificationConfiguration:
+        QueueConfigurations:
+        - Event: "s3:ObjectCreated:*"
+          Filter:
+            S3Key:
+              Rules:
+                - Name: prefix      # or "suffix"
+                  Value: pdfFiles   # The value to search for in the S3 object key names
+                - Name: suffix      # or "suffix"
+                  Value: .pdf
+          Queue: !GetAtt SQSQueue.Arn
+          
+
+  # SQS queue
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sampolly-queue
+  SQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties: 
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: __default_policy_ID
+        Statement:
+        - Sid: __owner_statement
+          Effect: Allow
+          Principal:
+            Service: s3.amazonaws.com
+          Action: SQS:*
+          Resource: !GetAtt SQSQueue.Arn
+        - Sid: __sender_statement
+          Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: SQS:SendMessage
+          Resource: !GetAtt SQSQueue.Arn
+      Queues: 
+        - !Ref SQSQueue
+
+  
+  # Dynamo Db to store session info
+  DynamoDBTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey: 
+        Name: etag
+        Type: String
+      TableName: s3_sessions2
+      Tags:
+        Key: Application
+        Value: Text2Audio
+      
+  # Create Stepfunction
+  PollyStepFunction:
+     Type: AWS::Serverless::StateMachine
+     Properties:
+      DefinitionUri: sam_textract_polly/pollyStep.json
+      # Tracing:
+      #  Enabled: True
+      Policies:
+        - LambdaInvokePolicy: 
+            FunctionName: !Ref TextractFunction
+        - LambdaInvokePolicy: 
+            FunctionName: !Ref TextractStatusFunction
+        - LambdaInvokePolicy:     
+            FunctionName: !Ref TextractPollyFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TextPollyFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TaskPollerFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref S3presignFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PollyStatusFunction
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTable
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+      DefinitionSubstitutions:
+        TextractFunctionArn: !GetAtt TextractFunction.Arn
+        TextractStatusFunctionArn : !GetAtt TextractStatusFunction.Arn
+        TextractPollyFunctionArn: !GetAtt TextractPollyFunction.Arn
+        TextPollyFunctionArn: !GetAtt TextPollyFunction.Arn
+        TaskPollerFunctionArn: !GetAtt TaskPollerFunction.Arn
+        PollyStatusFunctionArn: !GetAtt PollyStatusFunction.Arn
+        S3presignFunctionArn: !GetAtt S3presignFunction.Arn
+        DynamoDBTableName: !Ref DynamoDBTable
+
+  # Invoke Step function
+  InvokeStepFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    DependsOn: S3Bucket
+    Properties:
+      Handler: invokeStep.lambda_handler
+      Environment:
+        Variables:
+          StepFunction: !Ref PollyStepFunction
+          Table: !Ref DynamoDBTable
+      Policies:
+        - SQSPollerPolicy:
+            QueueName:
+              !GetAtt SQSQueue.QueueName
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt PollyStepFunction.Name
+        - CloudWatchPutMetricPolicy: {}
+        - DynamoDBWritePolicy:
+            TableName: !Ref DynamoDBTable
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+      Events:
+        MySQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SQSQueue.Arn
+            BatchSize: 10
+  # Step function Activity Tracker
+  ManualApproval:
+    Type: AWS::StepFunctions::Activity
+    Properties:
+      Name: PollyManualApproval
+  
+  TaskPollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: poller.lambda_handler
+      Policies:
+        - AWSStepFunctionsFullAccess
+        - AmazonSESFullAccess
+        - CloudWatchPutMetricPolicy: {}
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+      Environment:
+        Variables:
+          ActivityArn: !Ref ManualApproval
+          APIUrlEndpoint: "https://7ki7vhvrhj.execute-api.us-east-1.amazonaws.com/respond"
+  
+  PollerScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "PollerScheduledRule"
+      ScheduleExpression: "rate(10 minutes)"
+      # State: "ENABLED"
+      State: "DISABLED"
+      Targets: 
+        - Arn: !GetAtt TaskPollerFunction.Arn
+          Id: "TargetFunctionV1"
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref TaskPollerFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt PollerScheduledRule.Arn        
+        
+  
+  # Text based function
+  TextPollyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: TexttPolly.lambda_handler
+      Policies:
+        - CloudWatchPutMetricPolicy: {}
+        - S3CrudPolicy:
+            BucketName: !Ref S3Bucket
+        - AmazonPollyFullAccess   #Managed policy
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+
+  # Textract Function
+  TextractFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - S3Bucket
+    Properties:
+      Handler: Textract.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref S3Bucket
+        - CloudWatchPutMetricPolicy: {}
+        - TextractPolicy: {}
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        
+    
+  # Textract status Function
+  TextractStatusFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - TextractFunction
+    Properties:
+      Handler: TextractStatus.lambda_handler
+      Policies:
+        - CloudWatchPutMetricPolicy: {}
+        - TextractPolicy: {}
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        
+
+  # Textract Polly Content Function
+  TextractPollyFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - TextractStatusFunction
+    Properties:
+      Handler: TextractPolly.lambda_handler
+      Timeout: 240
+      MemorySize: 256
+      Environment:
+        Variables:
+          BucketName: !Ref S3Bucket
+      Policies:
+        - CloudWatchPutMetricPolicy: {}
+        - TextractPolicy: {}
+        - S3CrudPolicy:
+            BucketName: !Ref S3Bucket
+        - AmazonPollyFullAccess   #Managed policy
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+  
+  #Polly Status Function
+  PollyStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: PollyStatus.lambda_handler
+      Timeout: 240
+      # MemorySize: 256
+      Policies:
+        - CloudWatchPutMetricPolicy: {}
+        - AmazonPollyReadOnlyAccess   #Managed policy
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+  #
+  # S3 presign url
+  S3presignFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: S3presignurl.lambda_handler
+      Policies:
+        - CloudWatchPutMetricPolicy: {}
+        - S3ReadPolicy:
+            BucketName: !Ref S3Bucket
+            
+  # Cloudwatch Dashboard - Metrics explorer
+  CwDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Text2AudioDashboard4
+      DashboardBody: '
+      {
+   "widgets": [
+      {
+         "type": "explorer",
+         "width": 24,
+         "height": 15,
+         "x": 0,
+         "y": 0,
+         "properties": {
+            "metrics": [
+               {
+                  "metricName": "Invocations",
+                  "resourceType": "AWS::Lambda::Function",
+                  "stat": "Average"
+               },
+               {
+                  "metricName": "Duration",
+                  "resourceType": "AWS::Lambda::Function",
+                  "stat": "Average"
+               }               
+               
+            ],
+            "aggregateBy": {
+               "key": "FunctionName",
+               "func": "MAX"
+            },
+            "labels": [
+               {
+                  "key": "Application",
+                  "value": "Text2Audio"
+               }
+            ],
+            "widgetOptions": {
+               "legend": {
+                  "position": "bottom"
+               },
+               "view": "timeSeries",
+               "rowsPerPage": 8,
+               "widgetsPerRow": 2
+            },
+            "period": 21600,
+            "splitBy": "AvailabilityZone",
+            "title": "Text2AudioDashboard"
+         }
+      }
+   ]
+}
+'
+        
+
+
+Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  S3Bucket:
+    Description: S3 bucket to upload and download files
+    Value: !Ref S3Bucket
+  PollyStepFunction:
+    Description: PollyStepFunction
+    Value: !GetAtt PollyStepFunction.Name
+  TextractFunction:
+    Description: Texract function
+    Value: !Ref TextractFunction
+  TextractStatusFunction:
+    Description: Textract status function
+    Value: !Ref TextractStatusFunction
+  TextractPollyFunction:
+    Description: Textract Polly function
+    Value: !Ref TextractPollyFunction
