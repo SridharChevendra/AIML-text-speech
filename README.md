@@ -1,7 +1,7 @@
 # AIML-text-speech
 Use AWS AI/ML and serverless services to build text to speech
 ## Overview
-This solution enables users to upload .pdf files and provides .mp3 files with a pre-signed url.
+This solution enables users to upload .pdf files and provides .mp3 files with a pre-signed url.The following uses AWS SAM(Serverless Application Model) to deploy the resources.
 
 Solution outlined here uses the following AWS services.
 * AWS Lambda - Compute Engine to kickoff the respective AIML and orchestration Service
